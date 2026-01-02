@@ -1,0 +1,274 @@
+"""
+Modularized version of squarewave advection TV tests.
+
+Usage:
+    python squarewave_mod.py --nx 200 --c 0.5 --n_steps 50 --plot
+"""
+from typing import Callable, Dict, List, Tuple, Optional
+import argparse
+import logging
+import numpy as np
+import matplotlib.pyplot as plt
+import json
+import os
+
+# ---------- Utilities ----------
+def calculate_total_variation(phi: np.ndarray) -> float:
+    """Compute total variation of 1D field phi."""
+    return float(np.sum(np.abs(np.diff(phi))))
+
+# ---------- Step implementations (pure functions) ----------
+def ftbs_step(phi: np.ndarray, c: float) -> np.ndarray:
+    """Forward in time, backward in space (FTBS)."""
+    nx = phi.size
+    phi_im1 = np.roll(phi, 1)
+    return phi - c * (phi - phi_im1)
+
+def ftcs_step(phi: np.ndarray, c: float) -> np.ndarray:
+    """Centered in space, forward in time (FTCS). Note: unstable for pure advection."""
+    phi_ip1 = np.roll(phi, -1)
+    phi_im1 = np.roll(phi, 1)
+    return phi - 0.5 * c * (phi_ip1 - phi_im1)
+
+def ctcs_step(phi_prev: np.ndarray, phi_curr: np.ndarray, c: float) -> np.ndarray:
+    """Centered time, centered space (CTCS). Requires previous and current layers."""
+    phi_ip1 = np.roll(phi_curr, -1)
+    phi_im1 = np.roll(phi_curr, 1)
+    return phi_prev - c * (phi_ip1 - phi_im1)
+
+# Limiters
+def minmod(r: np.ndarray) -> np.ndarray:
+    return np.maximum(0, np.minimum(1, r))
+
+def superbee(r: np.ndarray) -> np.ndarray:
+    return np.maximum(0, np.maximum(np.minimum(2*r, 1), np.minimum(r, 2)))
+
+def vanleer(r: np.ndarray) -> np.ndarray:
+    return (r + np.abs(r)) / (1 + np.abs(r) + 1e-12)
+
+def vanalbada(r: np.ndarray) -> np.ndarray:
+    return (r*(1 + r)) / (1 + r*r + 1e-12)
+
+def tvd_upwind_step(phi: np.ndarray, c: float, limiter: Callable[[np.ndarray], np.ndarray]) -> np.ndarray:
+    """
+    TVD upwind style step using slope limiter.
+    phi: current state
+    c: Courant number
+    limiter: function r -> phi_lim (vectorized)
+    """
+    phi_im1 = np.roll(phi, 1)
+    phi_ip1 = np.roll(phi, -1)
+
+    # compute ratio r safely
+    eps = 1e-12
+    denom = (phi_ip1 - phi) + eps
+    r = (phi - phi_im1) / denom
+
+    phi_lim = limiter(r)
+
+    # left-biased or right-biased reconstructed values
+    if c >= 0:
+        phi_L = phi + 0.5 * phi_lim * (phi_ip1 - phi)
+        flux = phi_L
+    else:
+        phi_R = phi_ip1 - 0.5 * phi_lim * (phi_ip1 - phi)
+        flux = phi_R
+
+    flux_im1 = np.roll(flux, 1)
+    return phi - c * (flux - flux_im1)
+
+# ---------- High-level simulation runner ----------
+def run_simulation(
+    method_name: str,
+    phi_initial: np.ndarray,
+    c: float,
+    n_steps: int,
+    limiter_name: Optional[str] = None,
+    verbose: bool = False,
+    print_interval: int = 5
+) -> Tuple[List[float], np.ndarray]:
+    """
+    Run time loop and track total variation.
+
+    method_name: 'FTBS', 'FTCS', 'CTCS', 'TVD'
+    limiter_name: for 'TVD' choose 'minmod','superbee','vanleer','vanalbada'
+    Returns: (tv_history, final_state)
+    """
+    tv_history: List[float] = [calculate_total_variation(phi_initial)]
+    phi_curr = phi_initial.copy()
+    phi_prev = None  # for CTCS
+
+    # prepare limiter function if needed
+    limiter = None
+    if method_name == 'TVD':
+        if limiter_name == 'minmod':
+            limiter = minmod
+        elif limiter_name == 'superbee':
+            limiter = superbee
+        elif limiter_name == 'vanleer':
+            limiter = vanleer
+        elif limiter_name == 'vanalbada':
+            limiter = vanalbada
+        else:
+            raise ValueError("Unknown limiter for TVD: " + str(limiter_name))
+
+    if verbose:
+        logging.info("=== %s TV track ===", f"{method_name}{('-' + limiter_name) if limiter_name else ''}")
+        logging.info("initial TV: %.6f", tv_history[0])
+
+    for step in range(1, n_steps+1):
+        if method_name == 'FTBS':
+            phi_new = ftbs_step(phi_curr, c)
+        elif method_name == 'FTCS':
+            phi_new = ftcs_step(phi_curr, c)
+        elif method_name == 'CTCS':
+            # initialization: use FTCS for first advance if no phi_prev
+            if phi_prev is None:
+                phi_prev = phi_curr.copy()
+                phi_curr = ftcs_step(phi_curr, c)
+                phi_new = phi_curr.copy()
+            else:
+                phi_new = ctcs_step(phi_prev, phi_curr, c)
+                phi_prev = phi_curr
+                phi_curr = phi_new
+        elif method_name == 'TVD':
+            phi_new = tvd_upwind_step(phi_curr, c, limiter)
+        else:
+            raise ValueError("Unknown method: " + method_name)
+
+        # update for non-CTCS methods
+        if method_name != 'CTCS':
+            phi_prev = phi_curr
+            phi_curr = phi_new
+
+        current_tv = calculate_total_variation(phi_curr)
+        tv_history.append(current_tv)
+
+        if verbose and (step % print_interval == 0 or step == n_steps):
+            change = current_tv - tv_history[0]
+            change_percent = (change / tv_history[0]) * 100 if tv_history[0] != 0 else float('inf')
+            logging.info("step %3d: TV = %.6f (change: %+ .6f, %+ .2f%%)", step, current_tv, change, change_percent)
+
+    if verbose:
+        final_change = tv_history[-1] - tv_history[0]
+        final_change_percent = (final_change / tv_history[0]) * 100 if tv_history[0] != 0 else float('inf')
+        logging.info("final: TV = %.6f (change in all: %+ .6f, %+ .2f%%)", tv_history[-1], final_change, final_change_percent)
+
+    return tv_history, phi_curr
+
+# ---------- Plotting ----------
+def plot_results(
+    x: np.ndarray,
+    phi_initial: np.ndarray,
+    final_states: Dict[str, np.ndarray],
+    tv_histories: Dict[str, List[float]],
+    savefig: Optional[str] = None,
+    show: bool = True
+) -> None:
+    plt.figure(figsize=(12, 8))
+
+    # final states
+    plt.subplot(2, 1, 1)
+    plt.plot(x, phi_initial, 'k-', label="initial", linewidth=3, alpha=0.7)
+    colors = ['blue', 'red', 'green', 'cyan', 'magenta', 'brown', 'purple', 'orange', 'gray']
+    for i, (name, phi) in enumerate(final_states.items()):
+        plt.plot(x, phi, colors[i % len(colors)], label=name, linewidth=1.5)
+    plt.xlabel('x')
+    plt.ylabel('phi')
+    plt.title('Final States')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xlim([x.min(), x.max()])
+
+    # TV histories
+    plt.subplot(2, 1, 2)
+    for i, (name, tv) in enumerate(tv_histories.items()):
+        plt.plot(range(len(tv)), tv, colors[i % len(colors)], label=name, linewidth=2)
+    plt.axhline(y=tv_histories[next(iter(tv_histories))][0], color='black', linestyle='--', alpha=0.5, label='initial TV')
+    plt.xlabel('time step')
+    plt.ylabel('Total Variation')
+    plt.title('Total Variation Evolution')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    if savefig:
+        plt.savefig(savefig, dpi=200)
+    if show:
+        plt.show()
+    plt.close()
+
+# ---------- Main / CLI ----------
+def default_methods():
+    return [
+        ('FTBS', None),
+        #('FTCS', None),  # unstable generally
+        ('CTCS', None),
+        ('TVD', 'minmod'),
+        ('TVD', 'superbee'),
+        ('TVD', 'vanleer'),
+    ]
+
+def make_initial(nx: int) -> Tuple[np.ndarray, np.ndarray]:
+    x = np.linspace(0, 1, nx)
+    phi0 = np.zeros(nx)
+    phi0[nx//4:3*nx//4] = 1.0
+    return x, phi0
+
+def main(argv: Optional[List[str]] = None):
+    parser = argparse.ArgumentParser(description="TVD scheme experiments (modular)")
+    parser.add_argument("--nx", type=int, default=200)
+    parser.add_argument("--c", type=float, default=0.5)
+    parser.add_argument("--n_steps", type=int, default=50)
+    parser.add_argument("--methods", type=str, nargs='*', default=None,
+                        help="Method specs like FTBS or TVD:vanleer. If omitted uses defaults.")
+    parser.add_argument("--no-plot", action="store_true", help="Do not show plots")
+    parser.add_argument("--save-fig", type=str, default=None, help="Path to save figure")
+    parser.add_argument("--save-json", type=str, default=None, help="Save results (tv & final states) as json")
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
+                        format="%(levelname)s: %(message)s")
+
+    x, phi0 = make_initial(args.nx)
+    methods_input = args.methods
+    if methods_input:
+        methods = []
+        for m in methods_input:
+            if ':' in m:
+                name, limiter = m.split(':', 1)
+                methods.append((name.upper(), limiter))
+            else:
+                methods.append((m.upper(), None))
+    else:
+        methods = default_methods()
+
+    tv_histories: Dict[str, List[float]] = {}
+    final_states: Dict[str, np.ndarray] = {}
+
+    logging.info("initial TV: %.6f", calculate_total_variation(phi0))
+    for name, limiter in methods:
+        key = name if limiter is None else f"{name}-{limiter}"
+        logging.info("Running %s", key)
+        tv, final = run_simulation(name, phi0, args.c, args.n_steps, limiter_name=limiter, verbose=args.verbose)
+        tv_histories[key] = tv
+        final_states[key] = final
+
+    if not args.no_plot:
+        plot_results(x, phi0, final_states, tv_histories, savefig=args.save_fig, show=not args.no_plot)
+
+    if args.save_json:
+        # serialize numpy arrays as lists
+        out = {
+            "x": x.tolist(),
+            "phi_initial": phi0.tolist(),
+            "tv_histories": tv_histories,
+            "final_states": {k: v.tolist() for k, v in final_states.items()}
+        }
+        os.makedirs(os.path.dirname(args.save_json) or '.', exist_ok=True)
+        with open(args.save_json, 'w') as fh:
+            json.dump(out, fh, indent=2)
+
+if __name__ == "__main__":
+    main()
