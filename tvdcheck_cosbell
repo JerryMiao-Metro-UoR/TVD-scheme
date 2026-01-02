@@ -1,0 +1,142 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+from tvdcheck_squarewave import *
+
+# basic scheme were packed in tvdcheck_squarewave
+
+if not os.path.exists("plots"):
+    os.makedirs("plots")
+
+def cosBell(x, a=0, x0=0.5):
+    """cosbell"""
+    bell_width = 0.5
+    amplitude = 10
+    return np.where(np.abs(x - x0) < bell_width, 
+                  amplitude * 0.5*(1 + np.cos(np.pi*(x - x0)/bell_width)), 0)
+
+def cosBell_0_05(x):
+    "cosBell initial，a=0, x=0.5"
+    return cosBell(x, 0, 0.5)
+
+def calculate_total_variation(phi):
+    """total variation"""
+    return np.sum(np.abs(np.diff(phi)))
+
+def run_simulation_and_track_tv(method, phi_initial, c, n_steps, method_name, limiter_name=None):
+
+    # copy
+    if method == CTCS:
+        phi = [phi_initial.copy(), phi_initial.copy()]
+    else:
+        phi = [phi_initial.copy()]
+    
+    tv_history = [calculate_total_variation(phi_initial)]
+    
+    print(f"\n=== {method_name} TV track ===")
+    print(f"initial TV: {tv_history[0]:.6f}")
+    
+    for step in range(n_steps):
+        if limiter_name:
+            method(phi, c, limiter_name)
+        else:
+            method(phi, c)
+        
+        current_tv = calculate_total_variation(phi[-1])
+        tv_history.append(current_tv)
+        
+        if step % 5 == 0:  
+            change = current_tv - tv_history[0]
+            change_percent = (change / tv_history[0]) * 100
+            print(f"step {step:2d}: TV = {current_tv:.6f} (change: {change:+.6f}, {change_percent:+.2f}%)")
+    
+    final_change = tv_history[-1] - tv_history[0]
+    final_change_percent = (final_change / tv_history[0]) * 100
+    print(f"final: TV = {tv_history[-1]:.6f} (change in all: {final_change:+.6f}, {final_change_percent:+.2f}%)")
+    
+    return tv_history, phi[-1]
+
+def compare_schemes_with_tv(init_func, schemes, labels, outFile,
+                           nx=40, nt=20, u=1, endTime=0.2,
+                           xLim=[0,1], yLim=[None,None]):
+
+    dx = (xLim[1] - xLim[0])/nx
+    x = np.arange(xLim[0], xLim[1], dx)
+    dt = endTime/nt
+    c = nx*u*endTime/(nt*(xLim[1] - xLim[0])) # dt*u/dx
+    print('Courant =', c)
+    
+    # cosBell
+    phi0 = init_func(x)
+
+    cols = ['blue', 'red', 'green', 'cyan', 'magenta', 'brown', 'purple',
+            'pink', 'orange', 'gray', 'orange']
+    
+    # analytic
+    phiA = init_func((x - u*endTime)%(xLim[1] - xLim[0]))
+    
+    tv_histories = {}
+    final_states = {}
+
+    plt.figure(figsize=(15, 10))
+    
+    # plot1:final version comparision
+    plt.subplot(2, 1, 1)
+    plt.plot(x, phiA, 'k-', label="analytic", linewidth=3, alpha=0.7)
+    plt.plot(x, phi0, 'k--', label="initial condition", linewidth=2, alpha=0.5)
+    
+    # for each scheme
+    for i, (scheme, label) in enumerate(zip(schemes, labels)):
+        if label.startswith("TVD"):
+            # different limiters
+            if "-" in label:
+                limiter_name = label.split("-")[1]
+            else:
+                limiter_name = 'minmod'  # can be changed
+            tv_history, final_state = run_simulation_and_track_tv(
+                scheme, phi0, c, nt, label, limiter_name
+            )
+        else:
+            tv_history, final_state = run_simulation_and_track_tv(
+                scheme, phi0, c, nt, label
+            )
+        
+        tv_histories[label] = tv_history
+        final_states[label] = final_state
+        plt.plot(x, final_state, cols[i], label=label, linewidth=1.5)
+    
+    plt.xlim(xLim)
+    plt.ylim(yLim)
+    plt.xlabel('position x')
+    plt.ylabel('φ')
+    plt.title('final status')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # plot2:TVD comparosion
+    plt.subplot(2, 1, 2)
+    for label, tv_history in tv_histories.items():
+        plt.plot(range(len(tv_history)), tv_history, label=label, linewidth=2)
+    
+    plt.axhline(y=tv_histories[labels[0]][0], color='black', linestyle='--', 
+                alpha=0.5, label='initial TV')
+    plt.xlabel('time step')
+    plt.ylabel('Total Variation')
+    plt.title('TV on different schemes')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig("plots/"+outFile)
+    plt.show()
+    
+    return tv_histories, final_states
+
+schemes = [TVD_upwind, FTBS, CTCS, FTCS]
+labels = ["TVD-minmod", "FTBS", "CTCS", "FTCS"]
+
+tv_histories, final_states = compare_schemes_with_tv(
+    cosBell_0_05, schemes, labels, "schemes_comparison_with_tv.svg",
+    nx=40, nt=20, u=1.2, endTime=0.2, xLim=[0,2]
+)
+
